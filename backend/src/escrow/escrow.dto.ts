@@ -51,12 +51,14 @@ export const ReleaseEscrowSchema = z.object({
 
 export type ReleaseEscrowDto = z.infer<typeof ReleaseEscrowSchema>;
 
-export const RaiseDisputeSchema = z.object({
-  reason: z
-    .string()
-    .min(1, 'Dispute reason cannot be empty')
-    .max(1000, 'Dispute reason must be at most 1000 characters')
-    .optional(),
+export const BatchApproveMilestoneSchema = z.object({
+  milestoneIds: z.array(z.string().min(1)).min(1).max(100),
+  signerAddress: z.string().regex(/^G[A-Z2-7]{55}$/, 'Invalid Stellar address'),
 });
 
-export type RaiseDisputeDto = z.infer<typeof RaiseDisputeSchema>;
+export type BatchApproveMilestoneDto = z.infer<typeof BatchApproveMilestoneSchema>;
+
+export interface BatchApproveResult {
+  succeeded: Array<{ id: string; status: string }>;
+  failed: Array<{ id: string; reason: string }>;
+}

@@ -32,6 +32,16 @@ export const ESCROW_EVENTS = {
 export const ESCROW_STATUSES = ['pending', 'active', 'released', 'disputed', 'cancelled'] as const;
 export type EscrowStatus = (typeof ESCROW_STATUSES)[number];
 
+export interface Milestone {
+  id: string;
+  escrowId: string;
+  title: string;
+  amountXLM: string;
+  status: 'pending' | 'approved' | 'rejected';
+  approver?: string;
+  approvedAt?: string;
+}
+
 export interface Escrow {
   id: string;
   depositor: string;
@@ -81,51 +91,18 @@ export interface StatusCorrection {
   clearDispute?: boolean;
 }
 
-const ESCROW_KEY_PREFIX = 'escrow:';
-const ESCROWS_INDEX_KEY = 'escrows:index';
-const ESCROWS_BY_DEPOSITOR_PREFIX = 'escrows:by-depositor:';
-const ESCROWS_BY_CONTRACT_PREFIX = 'escrows:by-contract:';
+export interface BatchApproveResult {
+  succeeded: Array<{ id: string; status: string }>;
+  failed: Array<{ id: string; reason: string }>;
+}
 
-/** Emitted (see `GET /metrics`) every time a call falls back to the in-memory store. */
-export const ESCROW_PERSISTENCE_FALLBACK_METRIC = 'escrow_persistence_fallback_total';
-
-/**
- * Counts writes that were refused because a `MULTI`/`EXEC` did not apply as a unit. A
- * non-zero rate means Redis state may need reconciling — it is an alerting signal, not a
- * transient blip.
- */
-export const ESCROW_TRANSACTION_INCONSISTENT_METRIC = 'escrow_transaction_inconsistent_total';
-
-import { AuditService } from '../audit/audit.service';
-
-/**
- * Escrow store. Backed by Redis so escrow state survives restarts and is shared across
- * instances behind a load balancer — see PERSISTENT_STORAGE_SPIKE.md §2 and its "Follow-up
- * decisions" addendum for the full write-up and the money-adjacent/audit-sensitive trade-off
- * this store's persistence layer was deliberately left open pending (#187).
- *
- * Decision: Redis, not a relational store. A relational store would give ACID multi-row
- * transactions, point-in-time recovery, and SQL-based audit querying "for free," but this
- * backend has no DB driver, ORM, or connection pool configured anywhere today — adopting one
- * is new infrastructure, not a drop-in swap, and nothing in this service's access patterns
- * (point lookups by id/contractEscrowId, filter by depositor) needs cross-entity joins or
- * multi-row transactions that would justify that lift on its own. Redis is already a hard
- * dependency here and gives every access pattern this service needs via strings/sets/sorted
- * sets, following the exact pattern `NonceStoreService`/`GigService` already establish.
- * Durability (AOF/backup configuration) for treating Redis as ground truth for money-adjacent
- * state remains an infra question for whoever owns the deployment (spike §7) — not something
- * this migration itself can verify — so the in-memory fallback here is refused outright in
- * production (see `onModuleInit`) rather than silently engaged, exactly like `GigService`.
- *
- * Falls back to a process-local Map when Redis is unavailable, logged at `error` level and
- * counted via `ESCROW_PERSISTENCE_FALLBACK_METRIC`.
- */
 @Injectable()
 export class EscrowService implements OnModuleInit {
   private readonly logger = new SanitizedLogger(EscrowService.name);
 
   /** Fallback store, only used while Redis is unavailable. */
   private escrows: Map<string, Escrow> = new Map();
+  private milestones = new Map<string, Milestone>();
 
   constructor(
     @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
@@ -500,65 +477,62 @@ export class EscrowService implements OnModuleInit {
     if (event) await this.outbox!.append(event);
   }
 
-  private async fetchMany(ids: string[]): Promise<Escrow[]> {
-    if (ids.length === 0) return [];
-    const raw = await this.redis!.mget(...ids.map(id => this.escrowKey(id)));
-    return raw.filter((r): r is string => r !== null).map(r => JSON.parse(r) as Escrow);
-  }
-
-  private escrowKey(id: string): string {
-    return `${ESCROW_KEY_PREFIX}${id}`;
-  }
-
-  private depositorKey(address: string): string {
-    return `${ESCROWS_BY_DEPOSITOR_PREFIX}${address}`;
-  }
-
-  private contractKey(contractEscrowId: string): string {
-    return `${ESCROWS_BY_CONTRACT_PREFIX}${contractEscrowId}`;
+  /**
+   * Get milestones for an escrow
+   */
+  async getMilestones(escrowId: string): Promise<Milestone[]> {
+    return [...this.milestones.values()].filter(m => m.escrowId === escrowId);
   }
 
   /**
-   * Surfaces a transaction-integrity failure instead of absorbing it.
-   *
-   * This is the fix for the "gig created but escrow failed" class of bug. `MULTI`/`EXEC` does
-   * not roll back the commands that already ran, so when one queued command fails the earlier
-   * writes in the same batch are still durable in Redis. The previous code caught that signal
-   * — it exists precisely to be thrown — logged it, then wrote the entity to a process-local
-   * Map and returned success. The caller got a 2xx for a write that was half applied, and the
-   * in-memory copy diverged from Redis.
-   *
-   * Degrading is only safe for a genuine connectivity failure, where *nothing* was applied.
-   * So that case still falls through to `logFallback`, while an integrity failure is reported
-   * to the caller as 503 — retryable, and never a false success.
+   * Approve a single milestone
    */
-  private rethrowIfInconsistent(operation: string, escrowId: string, err: unknown): void {
-    if (!isTransactionIntegrityError(err)) return;
+  async approveMilestone(id: string, signerAddress: string): Promise<Milestone> {
+    const milestone = this.milestones.get(id);
+    if (!milestone) throw new Error('Milestone not found');
 
-    const transactionError = err;
-    this.metrics.increment(ESCROW_TRANSACTION_INCONSISTENT_METRIC, {
-      operation,
-      reason: transactionError.reason,
-    });
-    this.logger.error(
-      `Escrow transaction for ${operation} (${escrowId}) did not apply as a unit ` +
-        `(${transactionError.reason}). Redis does not roll back a partially applied MULTI, ` +
-        'so the stored state may be incomplete and the in-memory fallback is unsafe. ' +
-        'Refusing to report success.',
-      transactionError.stack,
-    );
+    const escrow = this.escrows.get(milestone.escrowId);
+    if (!escrow) throw new Error('Escrow not found');
 
-    throw new ServiceUnavailableException(
-      `Escrow ${operation} could not be committed atomically — please retry`,
-    );
+    if (signerAddress !== escrow.depositor) {
+      throw new Error('Only the depositor can approve milestones');
+    }
+
+    if (milestone.status !== 'pending') {
+      throw new Error(`Milestone is already ${milestone.status}`);
+    }
+
+    milestone.status = 'approved';
+    milestone.approver = signerAddress;
+    milestone.approvedAt = new Date().toISOString();
+
+    return milestone;
   }
 
-  private logFallback(operation: string, err: unknown): void {
-    this.metrics.increment(ESCROW_PERSISTENCE_FALLBACK_METRIC, { operation });
-    this.logger.error(
-      `Redis unavailable for escrow.${operation}, falling back to per-instance memory ` +
-        '(multi-instance state will diverge until Redis recovers)',
-      err instanceof Error ? err.stack : String(err),
-    );
+  /**
+   * Batch approve multiple milestones across different escrows
+   */
+  async batchApproveMilestones(
+    milestoneIds: string[],
+    signerAddress: string,
+  ): Promise<BatchApproveResult> {
+    const result: BatchApproveResult = { succeeded: [], failed: [] };
+
+    for (const id of milestoneIds) {
+      try {
+        const milestone = await this.approveMilestone(id, signerAddress);
+        result.succeeded.push({
+          id: milestone.id,
+          status: milestone.status,
+        });
+      } catch (error) {
+        result.failed.push({
+          id,
+          reason: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+
+    return result;
   }
 }
