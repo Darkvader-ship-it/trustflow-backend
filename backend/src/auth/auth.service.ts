@@ -6,6 +6,7 @@ import * as StellarSdk from '@stellar/stellar-sdk';
 import { getJwtVerificationSecrets } from '../config/env.config';
 import { NonceStoreService } from './nonce-store.service';
 import { JWT_ALGORITHM } from '../config/env.config';
+import { RefreshTokenStoreService, ACCESS_TOKEN_TTL_SECONDS } from './refresh-token-store.service';
 
 const CHALLENGE_PREFIX = 'Sign this message to authenticate with TrustFlow: ';
 
@@ -23,10 +24,11 @@ export class AuthService {
     const nonce = crypto.randomBytes(32).toString('hex');
     const challenge = `${CHALLENGE_PREFIX}${nonce}`;
 
-    await this.nonceStore.store(address, challenge, nonce);
-    this.logger.debug(`Challenge generated for ${this.maskAddress(address)}`);
+    // The store hands back an already-pending challenge rather than replacing it (#369).
+    const active = (await this.nonceStore.store(address, challenge, nonce)) ?? challenge;
+    this.logger.debug(`Challenge issued for ${this.maskAddress(address)}`);
 
-    return challenge;
+    return active;
   }
 
   async verifySignature(address: string, signature: string): Promise<boolean> {
@@ -102,8 +104,6 @@ export class AuthService {
     } catch (error) {
       throw new UnauthorizedException('Invalid token');
     }
-
-    throw new UnauthorizedException('Invalid token');
   }
 
   private extractNonce(challenge: string): string | null {

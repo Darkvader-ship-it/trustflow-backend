@@ -10,8 +10,14 @@ import { SanitizedLogger } from '../logging/sanitized-logger';
 import { redactIp, redactUrl } from '../logging/redaction';
 import { Request, Response } from 'express';
 import * as Sentry from '@sentry/node';
+import { getRequestId } from '../logging/request-context';
 import { SentryService } from '../../sentry/sentry.service';
 import { CorrelationIdStore } from '../logging/correlation-id.store';
+import {
+  isZodError,
+  validationException,
+  zodErrorToFieldErrors,
+} from '../validation/validation-error';
 
 /**
  * Extracts a usable HTTP status from an error that isn't a NestJS `HttpException` but still
@@ -40,9 +46,16 @@ export class SentryExceptionFilter implements ExceptionFilter {
   ) {}
 
   catch(exception: unknown, host: ArgumentsHost): void {
+    // A failed Zod `.parse()` in a handler is bad client input, not a server fault (#368):
+    // answer with the shared field-level 400 instead of a 500 that pages Sentry.
+    if (isZodError(exception)) {
+      exception = validationException(zodErrorToFieldErrors(exception));
+    }
+
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
-    const request = ctx.getRequest<Request & { correlationId?: string }>();
+    const request = ctx.getRequest<Request>();
+    const requestId = getRequestId(request);
 
     let status: number;
     let message: string;
@@ -89,15 +102,14 @@ export class SentryExceptionFilter implements ExceptionFilter {
       Sentry.withScope(scope => {
         scope.setTag('url', safeUrl);
         scope.setTag('method', request.method);
-        if (correlationId) {
-          scope.setTag('correlationId', correlationId);
-        }
+        scope.setTag('request_id', requestId);
+        scope.setTag('correlation_id', requestId);
         scope.setExtra('statusCode', status);
         scope.setUser({ ip_address: redactIp(request.ip) });
         this.sentryService.captureException(exception, 'SentryExceptionFilter');
       });
       this.logger.error(
-        `[${request.method}] ${safeUrl} correlationId=${correlationId ?? 'n/a'} — ${status}`,
+        `[${request.method}] ${request.url} — ${status} — requestId=${requestId}`,
         exception instanceof Error ? exception.stack : String(exception),
       );
     }

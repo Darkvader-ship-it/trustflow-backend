@@ -1,4 +1,4 @@
-import { INestApplication } from '@nestjs/common';
+import { INestApplication, VersioningType } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { ReputationController } from './reputation.controller';
@@ -91,6 +91,7 @@ describe('ReputationController Supertest integration', () => {
     }).compile();
 
     app = module.createNestApplication();
+    app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
     await app.init();
   });
 

@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Inject,
@@ -13,6 +14,7 @@ import { GigService } from '../gig/gig.service';
 import { GigStatus } from '../gig/gig.entity';
 import { UploadDeliverableDto } from './deliverable.dto';
 import { Deliverable, DeliverableStatus } from './deliverable.entity';
+import { PinStatus } from '../ipfs-pinning/ipfs-pinning.types';
 
 const DELIVERABLE_KEY_PREFIX = 'deliverable:';
 const DELIVERABLES_BY_GIG_PREFIX = 'deliverables:gig:';
@@ -36,6 +38,10 @@ export class DeliverableService {
   async upload(dto: UploadDeliverableDto, requester: string): Promise<Deliverable> {
     await this.assertMayDeliver(dto, requester);
 
+    // Decode base64 content to verify file magic bytes
+    const buffer = Buffer.from(dto.content, 'base64');
+    await this.validateFileMagicBytes(buffer, dto.filename);
+
     const id = `del-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
 
@@ -44,6 +50,7 @@ export class DeliverableService {
       filename: dto.filename,
     });
 
+    const deliverableStatus = this.mapPinStatusToDeliverableStatus(pinResult.status);
     const deliverable: Deliverable = {
       id,
       gigId: dto.gigId,
@@ -51,7 +58,7 @@ export class DeliverableService {
       cid: pinResult.cid,
       filename: dto.filename,
       size: pinResult.size,
-      status: DeliverableStatus.PINNED,
+      status: deliverableStatus,
       createdAt: now,
       updatedAt: now,
     };
@@ -71,6 +78,42 @@ export class DeliverableService {
 
     this.deliverables.set(id, deliverable);
     return deliverable;
+  }
+
+  /**
+   * Validates file content by inspecting magic bytes to prevent malicious files
+   * disguised with incorrect Content-Type headers. Rejects files that don't match
+   * the whitelist or have mismatched MIME types.
+   */
+  private async validateFileMagicBytes(buffer: Buffer, filename: string): Promise<void> {
+    const { fileTypeFromBuffer } = await import('file-type');
+    const detected = await fileTypeFromBuffer(buffer);
+
+    // Whitelist of allowed MIME types
+    const allowedMimeTypes = [
+      'application/pdf',
+      'image/png',
+      'image/jpeg',
+      'image/jpg',
+      'application/zip',
+      'application/x-zip-compressed',
+    ];
+
+    if (!detected) {
+      throw new BadRequestException(
+        'Unable to determine file type from content. Only PDF, PNG, JPEG, and ZIP files are allowed.',
+      );
+    }
+
+    if (!allowedMimeTypes.includes(detected.mime)) {
+      throw new BadRequestException(
+        `File type ${detected.mime} is not allowed. Only PDF, PNG, JPEG, and ZIP files are allowed.`,
+      );
+    }
+
+    this.logger.log(
+      `File validation passed: ${filename} detected as ${detected.mime} (${detected.ext})`,
+    );
   }
 
   /**
@@ -139,5 +182,18 @@ export class DeliverableService {
 
   private gigKey(gigId: string): string {
     return `${DELIVERABLES_BY_GIG_PREFIX}${gigId}`;
+  }
+
+  private mapPinStatusToDeliverableStatus(pinStatus: PinStatus): DeliverableStatus {
+    switch (pinStatus) {
+      case PinStatus.HEALTHY:
+        return DeliverableStatus.PINNED;
+      case PinStatus.DEGRADED:
+        return DeliverableStatus.PENDING;
+      case PinStatus.FAILED:
+        return DeliverableStatus.FAILED;
+      default:
+        return DeliverableStatus.FAILED;
+    }
   }
 }

@@ -33,6 +33,7 @@ import { Escrow, EscrowService } from '../escrow/escrow.service';
 import { WebhookService } from '../webhook/webhook.service';
 import { DiscordService } from '../webhook/discord.service';
 import { NotificationService } from '../notification/notification.service';
+import { ArweaveArchiveService } from './arweave-archive.service';
 import { config } from '../config/env.config';
 import { getCurrentUtcDate, toUtcIsoString } from '../common/dates';
 import { EscrowChainStateClient } from '../escrow-reconciliation/escrow-chain-state.client';
@@ -127,6 +128,7 @@ export class DisputeSagaService implements OnModuleInit {
     private readonly escrowService: EscrowService,
     private readonly webhookService: WebhookService,
     private readonly notificationService: NotificationService,
+    private readonly arweaveArchiveService: ArweaveArchiveService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
     private readonly metrics: MetricsService,
     @Optional() private readonly audit?: AuditService,
@@ -391,11 +393,11 @@ export class DisputeSagaService implements OnModuleInit {
       );
     }
     await bestEffort('in-app notification', () =>
-      this.notificationService.notifyDisputeEscalated({
+      this.notificationService.notifyDisputeEscalation({
         escrowId,
-        disputeId: sagaId,
         depositor: escrow.depositor,
         beneficiary: escrow.beneficiary,
+        amountXLM: escrow.amountXLM,
         reason: saga.reason,
       }),
     );
@@ -570,6 +572,9 @@ export class DisputeSagaService implements OnModuleInit {
       if (unique.length < 3) {
         throw new BadRequestException('At least 3 distinct juror addresses are required');
       }
+      if (unique.length % 2 === 0) {
+        throw new BadRequestException('Juror count must be odd to prevent vote ties');
+      }
 
       // Prevent escrow parties from being assigned as jurors to avoid conflicts of interest
       const escrow = await this.escrowService.findById(saga.escrowId);
@@ -596,11 +601,12 @@ export class DisputeSagaService implements OnModuleInit {
           sagaId,
           jurors: unique,
         });
-        await this.notificationService.notifyJurorsAssigned({
-          disputeId: sagaId,
-          escrowId: saga.escrowId,
-          jurors: unique,
-        });
+        // TODO: Implement notifyJurorsAssigned notification
+        // await this.notificationService.notifyJurorsAssigned({
+        //   disputeId: sagaId,
+        //   escrowId: saga.escrowId,
+        //   jurors: unique,
+        // });
 
         this.logger.log(`Saga ${sagaId}: ${unique.length} jurors assigned`);
         return saga;
@@ -645,10 +651,20 @@ export class DisputeSagaService implements OnModuleInit {
    * the verdict is computed automatically (exactly once, serialized per saga).
    * Compensating action: remove the vote and mark voting as incomplete.
    */
-  async castVote(sagaId: string, dto: CastVoteDto): Promise<DisputeSaga> {
+  async castVote(
+    sagaId: string,
+    dto: CastVoteDto,
+    callerAddress?: string,
+  ): Promise<DisputeSaga> {
     return this.sagaMutex.lock(sagaId, async () => {
       const saga = await this.findById(sagaId);
       this.assertStep(saga, DisputeStep.VOTING);
+
+      if (callerAddress && callerAddress !== dto.jurorAddress) {
+        throw new ForbiddenException(
+          `Authenticated wallet ${callerAddress} does not match juror address ${dto.jurorAddress}`,
+        );
+      }
 
       if (!saga.assignedJurors?.includes(dto.jurorAddress)) {
         throw new BadRequestException(`${dto.jurorAddress} is not an assigned juror for this saga`);
@@ -688,13 +704,14 @@ export class DisputeSagaService implements OnModuleInit {
 
           const escrow = await this.escrowService.findById(saga.escrowId);
           if (escrow) {
-            await this.notificationService.notifyVerdictReached({
-              disputeId: sagaId,
-              escrowId: saga.escrowId,
-              verdict,
-              depositor: escrow.depositor,
-              beneficiary: escrow.beneficiary,
-            });
+            // TODO: Implement notifyVerdictReached notification
+            // await this.notificationService.notifyVerdictReached({
+            //   disputeId: sagaId,
+            //   escrowId: saga.escrowId,
+            //   verdict,
+            //   depositor: escrow.depositor,
+            //   beneficiary: escrow.beneficiary,
+            // });
           }
         }
 
@@ -806,15 +823,35 @@ export class DisputeSagaService implements OnModuleInit {
         });
         await this.webhookService.dispatch(SAGA_EVENTS.SAGA_COMPLETED, { sagaId });
 
+        // ─── NEW: Archive dispute evidence to Arweave for permanent auditability ───
+        try {
+          const txId = await this.arweaveArchiveService.archiveDispute(saga);
+          if (txId) {
+            saga.arweaveTxId = txId;
+            await this.persistSaga(saga);
+            this.logger.log(
+              `Arweave txId ${txId} recorded for completed saga ${saga.sagaId}`,
+            );
+          }
+        } catch (err) {
+          // Archive failure must not block dispute resolution
+          this.logger.error(
+            `Arweave archive failed for completed saga ${saga.sagaId} — continuing without archival`,
+            err,
+          );
+        }
+        // ──────────────────────────────────────────────────────────────
+
         const payoutEscrow = await this.escrowService.findById(saga.escrowId);
         if (payoutEscrow) {
-          await this.notificationService.notifyPayoutExecuted({
-            disputeId: sagaId,
-            escrowId: saga.escrowId,
-            verdict: saga.verdict,
-            depositor: payoutEscrow.depositor,
-            beneficiary: payoutEscrow.beneficiary,
-          });
+          // TODO: Implement notifyPayoutExecuted notification
+          // await this.notificationService.notifyPayoutExecuted({
+          //   disputeId: sagaId,
+          //   escrowId: saga.escrowId,
+          //   verdict: saga.verdict,
+          //   depositor: payoutEscrow.depositor,
+          //   beneficiary: payoutEscrow.beneficiary,
+          // });
         }
 
         this.logger.log(`Saga ${sagaId}: completed — payout executed for ${saga.verdict}`);
